@@ -1185,11 +1185,136 @@ if(0){
 }
 
 
+#================#
+# DIABLO Analysis ----
+#================#
+library(mixOmics)
+
+set.seed(2707083)
+
+#=== Process TCGA Data ===#
+# Keep only samples that appear in all 3 datasets
+com = intersect(colnames(omics.dat$mrna), intersect(colnames(omics.dat$mirna), colnames(omics.dat$methyl)))
+diablo_dat = lapply(omics.dat, function(x) {
+  t(x[,match(com, colnames(x))])
+})
 
 
+# Get vector of sample class memberships
+tt_tmp = extract_string(rownames(diablo_dat$mrna), "-", 4)
+Y = ifelse(tt_tmp == "01", "tumor", ifelse(tt_tmp == "11", "normal", "other"))
+
+### DIABLO
+## Create Design Matrix... Lower values = better class discrimination, Higher values = more correlated features across datasets
+design = matrix(0.5, ncol = length(diablo_dat), nrow = length(diablo_dat), 
+                dimnames = list(names(diablo_dat), names(diablo_dat)))
+diag(design) = 0
+
+## Choose number of components
+dist.name = "mahalanobis.dist"
+if(0){
+  diablo.tcga <- block.plsda(diablo_dat, Y, ncomp = 5, design = design)
+  
+  perf.diablo.tcga = perf(diablo.tcga, validation = 'Mfold', folds = 10, nrepeat = 10)
+  
+  perf.diablo.tcga$error.rate  # Lists the different types of error rates
+  
+  # Plot of the error rates based on weighted vote
+  plot(perf.diablo.tcga)
+  
+  perf.diablo.tcga$choice.ncomp$WeightedVote
+  
+  ncomp <- perf.diablo.tcga$choice.ncomp$WeightedVote["Overall.BER", dist.name]
+}
+
+ncomp = 5
+
+# Number of variables to select for each dataset
+if(0){
+  test.keepX <- list(mrna = c(seq(5, 30, 5)),
+                     mirna = c(seq(5, 30, 5)),
+                     methyl = c(seq(5, 30, 5)))
+  tune.diablo.tcga <- tune.block.splsda(diablo_dat, Y, ncomp = ncomp, 
+                                        test.keepX = test.keepX, design = design,
+                                        validation = 'Mfold', folds = 10, nrepeat = 1, 
+                                        BPPARAM = BiocParallel::SnowParam(workers = 4),
+                                        dist = dist.name)
+  list.keepX <- tune.diablo.tcga$choice.keepX
+  # Recommended
+  list.keepX = list(mrna = c(5, 5, 5, 5, 5),
+                    mirna = c(5, 5, 5, 5, 5),
+                    methyl = c(5, 5, 5, 5, 5)) 
+}
+
+list.keepX = list(mrna = c(150, 5, 5, 5, 5),
+                  mirna = c(6, 5, 5, 5, 5),
+                  methyl = c(5, 5, 5, 5, 5)) 
 
 
+# Fit Final Model
+diablo.tcga <- block.splsda(diablo_dat, Y, ncomp = ncomp, 
+                            keepX = list.keepX, design = design)
+
+factor_id = 1
+mrna.d = selectVar(diablo.tcga, block = 'mrna', comp = factor_id)$mrna$name
+mirna.d = selectVar(diablo.tcga, block = 'mirna', comp = factor_id)$mirna$name
+methyl.d =selectVar(diablo.tcga, block = 'methyl', comp = factor_id)$methyl$name
 
 
+# Load in final AMEND module (n=150, using IN degree bias adjustment, hazard ratios as biased random walk attribute, and aggregating mRNA component using STRING edges)
+amend = readRDS(paste0(path.amend.res, "TCGA_n150_db.IN_agg.string_brw.rds"))
+
+## Mapping Entrez IDs to Symbols
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", host = "https://jan2024.archive.ensembl.org")
+mart_data <- useDataset("hsapiens_gene_ensembl", mart = mart)
+uniq.entrez = unique(V(amend$module)$EntrezID)
+uniq.entrez = uniq.entrez[!is.na(uniq.entrez)]
+symbol2entrez <- getBM(attributes = c('hgnc_symbol', "entrezgene_id"),
+                       filters = 'entrezgene_id',
+                       values = uniq.entrez,
+                       mart = mart_data)
+# Remove features that didn't map
+symbol2entrez = symbol2entrez[apply(symbol2entrez,1,function(x) all(x != "")), ] 
+id = match(V(amend$module)$EntrezID, symbol2entrez[,2])
+V(amend$module)$Symbol[!is.na(id)] = symbol2entrez[id[!is.na(id)],1]
 
 
+## mRNA
+mrna.a = V(amend$module)$Symbol[extract_string(V(amend$module)$name, "\\|", 2) == "mrna"]
+mrna.ji = length(intersect(mrna.a, mrna.d)) / min(length(mrna.a), length(mrna.d)) # Jaccard Index: AMEND & DIABLO
+
+## miRNA
+mirna.a = extract_string(V(amend$module)$name[extract_string(V(amend$module)$name, "\\|", 2) == "mirna"], "\\|", 1)
+mirna.ji = length(intersect(mirna.a, mirna.d)) / min(length(mirna.a), length(mirna.d)) # Jaccard Index: AMEND & DIABLO
+
+
+# AMEND & DIABLO... Figure 8
+### LogFC weighted by 1 minus P-value
+par(mfrow = c(1,2))
+## mRNA
+logfc.a = abs(de.res$mrna$logFC[rownames(de.res$mrna) %in% mrna.a])
+logfc.d = abs(de.res$mrna$logFC[rownames(de.res$mrna) %in% mrna.d])
+pval.a = de.res$mrna$P.Value[rownames(de.res$mrna) %in% mrna.a]
+pval.d = de.res$mrna$P.Value[rownames(de.res$mrna) %in% mrna.d]
+score.a = logfc.a * (1 - pval.a)
+score.d = logfc.d * (1 - pval.d)
+dat = data.frame(score = c(score.a, score.d), method = c(rep("AMEND", length(score.a)), rep("DIABLO", length(score.d))))
+# kw_pval = kruskal.test(score ~ method, data = dat)$p.value
+w_pval = wilcox.test(score ~ method, data = dat)$p.value
+boxplot(score ~ method, data = dat, xlab = "Method", ylab = "|logFC| * (1 - pvalue)", 
+        main = paste0("mRNA Features (MW p-value", ifelse(w_pval < 1e-4, " < 0.0001)", paste0(" = ", round(w_pval, 4), ")"))))
+
+## miRNA
+logfc.a = abs(de.res$mirna$logFC[rownames(de.res$mirna) %in% mirna.a])
+logfc.d = abs(de.res$mirna$logFC[rownames(de.res$mirna) %in% mirna.d])
+pval.a = de.res$mirna$P.Value[rownames(de.res$mirna) %in% mirna.a]
+pval.d = de.res$mirna$P.Value[rownames(de.res$mirna) %in% mirna.d]
+score.a = logfc.a * (1 - pval.a)
+score.d = logfc.d * (1 - pval.d)
+dat = data.frame(score = c(score.a, score.d), method = c(rep("AMEND", length(score.a)), rep("DIABLO", length(score.d))))
+# kw_pval = kruskal.test(score ~ method, data = dat)$p.value
+w_pval = wilcox.test(score ~ method, data = dat)$p.value
+stripchart(score ~ method, data = dat, vertical = TRUE, method = "overplot",
+           pch = 7, col = "blue", xlab = "Method", ylab = "|logFC| * (1 - pvalue)",
+           main = paste0("miRNA Features (MW p-value", ifelse(w_pval < 1e-4, " < 0.0001)", paste0(" = ", round(w_pval, 4), ")"))), 
+           at = c(1.25, 1.75), cex = 1.5)
